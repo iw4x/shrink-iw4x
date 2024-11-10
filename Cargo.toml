@@ -1,0 +1,8 @@
+[package]
+name = "shrink-iw4x"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+zip = "2.2"
+walkdir = "2.5"
