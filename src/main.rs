@@ -8,34 +8,6 @@ use zip::{ZipArchive, ZipWriter};
 const DIRS_TO_PROCESS: [&str; 2] = ["main", "iw4x"];
 const REMOVABLE_PATTERNS: [&str; 3] = ["images", "sound", "video"];
 const REMOVABLE_EXTENSIONS: [&str; 2] = ["iwi", "mp3"];
-const MB_DIVISOR: f64 = 1_048_576.0;
-
-struct ProcessingStats {
-    files_removed: u32,
-    bytes_removed: u64,
-}
-
-impl ProcessingStats {
-    fn new() -> Self {
-        Self {
-            files_removed: 0,
-            bytes_removed: 0,
-        }
-    }
-
-    fn add(&mut self, files: u32, bytes: u64) {
-        self.files_removed += files;
-        self.bytes_removed += bytes;
-    }
-
-    fn display_total(&self) {
-        println!("\nTotal files removed: {}", self.files_removed);
-        println!(
-            "Total size removed: {:.2} MB",
-            self.bytes_removed as f64 / MB_DIVISOR
-        );
-    }
-}
 
 fn main() -> io::Result<()> {
     let base_dir = env::args()
@@ -48,75 +20,73 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    let mut stats = ProcessingStats::new();
+    let mut total_files_removed = 0;
+    let mut total_bytes_removed = 0;
 
     for dir_name in DIRS_TO_PROCESS {
-        process_directory(&base_dir, dir_name, &mut stats)?;
+        let (files, bytes) = process_directory(&base_dir, dir_name)?;
+        total_files_removed += files;
+        total_bytes_removed += bytes;
     }
 
-    stats.display_total();
+    println!("\nTotal files removed: {}", total_files_removed);
+    println!(
+        "Total size removed: {:.2} MB",
+        total_bytes_removed as f64 / 1_048_576.0
+    );
     Ok(())
 }
 
-fn process_directory(base_dir: &Path, dir_name: &str, stats: &mut ProcessingStats) -> io::Result<()> {
+fn process_directory(base_dir: &Path, dir_name: &str) -> io::Result<(u32, u64)> {
     let work_dir = base_dir.join(dir_name);
     if !work_dir.exists() {
         println!("Directory '{}' not found, skipping...", work_dir.display());
-        return Ok(());
+        return Ok((0, 0));
     }
 
     println!("\nProcessing directory: {}", work_dir.display());
 
-    if let Some(video_bytes) = process_video_directory(&work_dir)? {
-        stats.add(0, video_bytes);
-    }
+    let mut files_removed = 0;
+    let mut bytes_removed = 0;
 
-    process_iwd_files(&work_dir, stats)?;
-
-    Ok(())
-}
-
-fn process_video_directory(work_dir: &Path) -> io::Result<Option<u64>> {
     let video_dir = work_dir.join("video");
-    if !video_dir.exists() {
-        return Ok(None);
+    if video_dir.exists() {
+        let video_size = get_dir_size(&video_dir)?;
+        println!(
+            "Removing video directory ({:.2} MB)...",
+            video_size as f64 / 1_048_576.0
+        );
+        fs::remove_dir_all(&video_dir)?;
+        bytes_removed += video_size;
     }
 
-    let video_size = get_dir_size(&video_dir)?;
-    println!(
-        "Removing video directory ({:.2} MB)...",
-        video_size as f64 / MB_DIVISOR
-    );
-    fs::remove_dir_all(&video_dir)?;
-    Ok(Some(video_size))
-}
-
-fn process_iwd_files(work_dir: &Path, stats: &mut ProcessingStats) -> io::Result<()> {
-    for entry in WalkDir::new(work_dir).min_depth(1).max_depth(1) {
+    for entry in WalkDir::new(&work_dir).min_depth(1).max_depth(1) {
         let entry = entry?;
         let path = entry.path();
 
-        if path.is_file() && path.extension().map_or(false, |ext| ext == "iwd") {
+        if path.is_file() && path.extension().is_some_and(|ext| ext == "iwd") {
             println!("Processing: {}", path.display());
             match process_iwd_file(path) {
-                Ok((files, bytes)) => stats.add(files, bytes),
+                Ok((files, bytes)) => {
+                    files_removed += files;
+                    bytes_removed += bytes;
+                }
                 Err(e) => println!("Error processing {}: {}", path.display(), e),
             }
         }
     }
-    Ok(())
+
+    Ok((files_removed, bytes_removed))
 }
 
 fn get_dir_size(path: &Path) -> io::Result<u64> {
-    let mut total_size = 0;
-    for entry in WalkDir::new(path)
+    WalkDir::new(path)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_file())
-    {
-        total_size += entry.metadata()?.len();
-    }
-    Ok(total_size)
+        .try_fold(0, |acc, entry| -> io::Result<u64> {
+            Ok(acc + entry.metadata()?.len())
+        })
 }
 
 fn should_remove_file(name: &str) -> bool {
@@ -127,32 +97,13 @@ fn should_remove_file(name: &str) -> bool {
         || path
             .extension()
             .and_then(|ext| ext.to_str())
-            .map_or(false, |ext| REMOVABLE_EXTENSIONS.contains(&ext))
+            .is_some_and(|ext| REMOVABLE_EXTENSIONS.contains(&ext))
 }
 
 fn process_iwd_file(path: &Path) -> io::Result<(u32, u64)> {
     let file = File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
-    let total_files = archive.len();
 
-    let (files_to_remove, bytes_to_remove) = analyze_archive(&mut archive)?;
-    if files_to_remove.is_empty() {
-        return Ok((0, 0));
-    }
-
-    create_filtered_archive(path, &mut archive, &files_to_remove, total_files)?;
-
-    println!(
-        "Removed {} files ({:.2} MB) from {}",
-        files_to_remove.len(),
-        bytes_to_remove as f64 / MB_DIVISOR,
-        path.display()
-    );
-
-    Ok((files_to_remove.len() as u32, bytes_to_remove))
-}
-
-fn analyze_archive(archive: &mut ZipArchive<File>) -> io::Result<(Vec<usize>, u64)> {
     let mut files_to_remove = Vec::new();
     let mut bytes_to_remove = 0;
 
@@ -164,29 +115,21 @@ fn analyze_archive(archive: &mut ZipArchive<File>) -> io::Result<(Vec<usize>, u6
         }
     }
 
-    Ok((files_to_remove, bytes_to_remove))
-}
+    if files_to_remove.is_empty() {
+        return Ok((0, 0));
+    }
 
-fn create_filtered_archive(
-    path: &Path,
-    archive: &mut ZipArchive<File>,
-    files_to_remove: &[usize],
-    total_files: usize,
-) -> io::Result<()> {
     let temp_path = path.with_extension("iwd.temp");
     let temp_file = File::create(&temp_path)?;
     let mut zip_writer = ZipWriter::new(temp_file);
 
-    for i in 0..total_files {
-        if files_to_remove.contains(&i) {
-            continue;
-        }
-
-        let file = archive.by_index(i)?;
-        let name = file.name().to_string();
-
-        if let Err(e) = zip_writer.raw_copy_file(file) {
-            println!("Failed to copy {}: {}", name, e);
+    for i in 0..archive.len() {
+        if !files_to_remove.contains(&i) {
+            let file = archive.by_index(i)?;
+            let name = file.name().to_string();
+            if let Err(e) = zip_writer.raw_copy_file(file) {
+                println!("Failed to copy {}: {}", name, e);
+            }
         }
     }
 
@@ -194,5 +137,12 @@ fn create_filtered_archive(
     fs::remove_file(path)?;
     fs::rename(temp_path, path)?;
 
-    Ok(())
+    println!(
+        "Removed {} files ({:.2} MB) from {}",
+        files_to_remove.len(),
+        bytes_to_remove as f64 / 1_048_576.0,
+        path.display()
+    );
+
+    Ok((files_to_remove.len() as u32, bytes_to_remove))
 }
